@@ -2,6 +2,8 @@ import io
 import os
 import struct
 
+import sys
+
 # Python 2 compat
 try:
     num_types = (int, float, long)
@@ -18,11 +20,57 @@ from fitparse.records import (
 )
 from fitparse.utils import calc_crc, FitParseError, FitEOFError, FitCRCError, FitHeaderError
 
+def get_field(message, is_dev, def_nums):
+    if type(def_nums) is not list:
+        def_nums = [def_nums]
+    for field_data in message:
+        fdef = field_data.field_def
+        if (fdef is not None and
+            hasattr(fdef, 'dev_data_index') == is_dev and
+            fdef.def_num in def_nums):
+
+            return field_data
+
+def copy_field(src, dest):
+    if src is not None and dest is not None:
+        # src.value might have been postprocessed by unit/type/fild processors
+        # so re-compute the value
+        val = src.decode_raw_value()
+        dest.set_value(val)
+        # view postprocessed value in output
+        dest.value = src.value
+
+def copy_dev_to_native(message, dev_ids, n_id):
+    dev_field = get_field(message, True, dev_ids)
+    nat_field = get_field(message, False, n_id)
+    copy_field(dev_field, nat_field)
+
+def adjust_message(msg):
+    #print msg.mesg_num
+    #if msg.type == 'data' and msg.mesg_num == 20: # Record
+    #    for field_data in msg:
+    #        print field_data.field_def
+
+    if msg.type == 'data' and msg.mesg_num == 20: # Record
+        copy_dev_to_native(msg, [0, 23], 5) # distance
+
+    if msg.type == 'data' and msg.mesg_num == 19:  # Lap
+        copy_dev_to_native(msg, 4, 9) # total_distance
+
+    if msg.type == 'data' and msg.mesg_num == 18:  # Session
+        copy_dev_to_native(msg, [7, 25], 9) # total_distance
+        copy_dev_to_native(msg, 21, 14)     # avg_speed
+
+
 class FitFile(object):
-    def __init__(self, fileish, check_crc=True, data_processor=None):
+    def __init__(self, fileish, check_crc=True, data_processor=None, out=None):
+        self._verbose = False
+        print("HELLO")
+
         if hasattr(fileish, 'read'):
             # BytesIO-like object
             self._file = fileish
+            self._out = out
         elif isinstance(fileish, str):
             # Python2 - file path, file contents in the case of a TypeError
             # Python3 - file path
@@ -52,6 +100,9 @@ class FitFile(object):
         if hasattr(self, "_file") and self._file and hasattr(self._file, "close"):
             self._file.close()
             self._file = None
+        if  self._out and hasattr(self._out, "close"):
+            self._out.close()
+            self._out = None
 
     def __enter__(self):
         return self
@@ -70,6 +121,11 @@ class FitFile(object):
         self._bytes_left -= len(data)
         return data
 
+    def _write(self, data):
+        if self._out and data:
+            self._out.write(data)
+            self._out_crc = calc_crc(data, self._out_crc)
+
     def _read_struct(self, fmt, endian='<', data=None, always_tuple=False):
         fmt_with_endian = "%s%s" % (endian, fmt)
         size = struct.calcsize(fmt_with_endian)
@@ -86,6 +142,21 @@ class FitFile(object):
         # Flatten tuple if it's got only one value
         return unpacked if (len(unpacked) > 1) or always_tuple else unpacked[0]
 
+    def _write_struct(self, data, fmt, endian='<'):
+        if self._out is None:
+            return
+
+        fmt_with_endian = "%s%s" % (endian, fmt)
+        size = struct.calcsize(fmt_with_endian)
+        if size <= 0:
+            raise FitParseError("Invalid struct format: %s" % fmt_with_endian)
+
+        if type(data)==tuple:
+            packed = struct.pack(fmt_with_endian, *data)
+        else:
+            packed = struct.pack(fmt_with_endian, data)
+        self._write(packed)
+
     def _read_and_assert_crc(self, allow_zero=False):
         # CRC Calculation is little endian from SDK
         crc_expected, crc_actual = self._crc, self._read_struct('H')
@@ -94,6 +165,9 @@ class FitFile(object):
             if self.check_crc:
                 raise FitCRCError('CRC Mismatch [expected = 0x%04X, actual = 0x%04X]' % (
                     crc_expected, crc_actual))
+
+    def _write_crc(self):
+        self._write_struct((self._out_crc,), 'H')
 
     ##########
     # Private Data Parsing Methods
@@ -106,6 +180,7 @@ class FitFile(object):
         self._complete = False
         self._compressed_ts_accumulator = 0
         self._crc = 0
+        self._out_crc = 0
         self._local_mesgs = {}
         self._messages = []
 
@@ -115,6 +190,8 @@ class FitFile(object):
 
         # Larger fields are explicitly little endian from SDK
         header_size, protocol_ver_enc, profile_ver_enc, data_size = self._read_struct('2BHI4x', data=header_data)
+
+        self._write(header_data)
 
         # Decode the same way the SDK does
         self.protocol_version = float("%d.%d" % (protocol_ver_enc >> 4, protocol_ver_enc & ((1 << 4) - 1)))
@@ -129,10 +206,12 @@ class FitFile(object):
 
             # Consume extra two bytes of header and check CRC
             self._read_and_assert_crc(allow_zero=True)
+            self._write_crc()
 
             # Consume any extra bytes, since header size "may be increased in
             # "future to add additional optional information" (from SDK)
-            self._read(extra_header_size - 2)
+            unknown = self._read(extra_header_size - 2)
+            self._write(unknown)
 
         # After we've consumed the header, set the bytes left to be read
         self._bytes_left = data_size
@@ -142,6 +221,7 @@ class FitFile(object):
         if self._bytes_left <= 0:
             if not self._complete:
                 self._read_and_assert_crc()
+                self._write_crc()
 
             if self._file.tell() >= self._filesize:
                 self._complete = True
@@ -153,11 +233,15 @@ class FitFile(object):
             return self._parse_message()
 
         header = self._parse_message_header()
+        self._write_message_header(header)
 
         if header.is_definition:
             message = self._parse_definition_message(header)
+            self._write_definition_message(message)
         else:
             message = self._parse_data_message(header)
+            adjust_message(message)
+            self._write_data_message(message)
             if message.mesg_type is not None:
                 if message.mesg_type.name == 'developer_data_id':
                     add_dev_data_id(message)
@@ -184,6 +268,18 @@ class FitFile(object):
                 local_mesg_num=header & 0xF,  # bits 0-3
                 time_offset=None,
             )
+
+    def _write_message_header(self, header):
+        data = 0
+        if header.time_offset is not None:
+            data |= 0x80
+            data |= header.local_mesg_num << 5
+            data |= header.time_offset
+        else:
+            data |= 0x40 if header.is_definition else 0
+            data |= 0x20 if header.is_developer_data else 0
+            data |= header.local_mesg_num
+        self._write_struct((data,), 'B')
 
     def _parse_definition_message(self, header):
         # Read reserved byte and architecture byte to resolve endian
@@ -242,7 +338,19 @@ class FitFile(object):
             dev_field_defs=dev_field_defs,
         )
         self._local_mesgs[header.local_mesg_num] = def_mesg
+        if self._verbose:
+            print("DefinitionMessage", num_fields,len(dev_field_defs))
         return def_mesg
+
+    def _write_definition_message(self, msg):
+        self._write_struct((0, msg.mesg_num, len(msg.field_defs)), 'HHB')
+        for fld in msg.field_defs:
+            self._write_struct((fld.def_num, fld.size, fld.base_type.identifier), '3B')
+        if msg.header.is_developer_data:
+            self._write_struct(len(msg.dev_field_defs), 'B')
+            for fld in msg.dev_field_defs:
+                self._write_struct((fld.def_num, fld.size, fld.dev_data_index), '3B')
+
 
     def _parse_raw_values_from_data_message(self, def_mesg):
         # Go through mesg's field defs and read them
@@ -271,7 +379,31 @@ class FitFile(object):
                 raw_value = base_type.parse(raw_value)
 
             raw_values.append(raw_value)
+            if self._verbose:
+                print("read ", field_def, struct_fmt, raw_value)
         return raw_values
+
+    def _write_raw_values_from_data_message(self, def_mesg, raw_values):
+        for field_def, raw_value in zip(def_mesg.field_defs + def_mesg.dev_field_defs, raw_values):
+            base_type = field_def.base_type
+            is_byte = base_type.name == 'byte'
+            # Struct to read n base types (field def size / base type size)
+            struct_fmt = '%d%s' % (
+                field_def.size / base_type.size,
+                base_type.fmt,
+            )
+            if is_byte and raw_value is None:
+                raw_value = tuple(base_type.unparse(raw_value)*field_def.size)
+            else:
+                raw_value = base_type.unparse(raw_value)
+            if self._verbose:
+                print("write ", field_def, struct_fmt, raw_value)
+            try:
+                self._write_struct(raw_value, struct_fmt, endian=def_mesg.endian)
+            except:
+                print("Error in _write_struct:", raw_value, struct_fmt, def_mesg.endian)
+                print(sys.exc_info()[0])
+                raise
 
     @staticmethod
     def _resolve_subfield(field, def_mesg, raw_values):
@@ -408,12 +540,25 @@ class FitFile(object):
         data_message = DataMessage(header=header, def_mesg=def_mesg, fields=field_datas)
         self._processor.run_message_processor(data_message)
 
+        if self._verbose:
+            print("DataMessage", len(field_datas))
         return data_message
+
+    def _write_data_message(self, msg):
+        raw_values = []
+        for fld in msg.fields:
+            if fld.field_def is not None:
+                raw_values.append(fld.raw_value)
+
+        self._write_raw_values_from_data_message(msg.def_mesg, raw_values)
+
+
 
     ##########
     # Public API
 
-    def get_messages(self, name=None, with_definitions=False, as_dict=False):
+    def get_messages(self, name=None, with_definitions=False, as_dict=False, verbose=False):
+        self._verbose=verbose
         if with_definitions:  # with_definitions implies as_dict=False
             as_dict = False
 

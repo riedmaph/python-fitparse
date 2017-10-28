@@ -60,6 +60,7 @@ def parse_args(args=None):
         parser.error('Please specify an output file (-o) or set --type readable')
 
     options.with_defs = (options.verbose >= 1)
+    options.vverbose = (options.verbose >= 1)
     options.print_messages = (options.type == 'readable')
     options.print_stream = (options.output or sys.stdout)
 
@@ -77,10 +78,12 @@ def main(args=None):
         options.infile,
         data_processor=fitparse.StandardUnitsDataProcessor(),
         check_crc = not(options.ignore_crc),
+        out = open(options.infile.name + "out.fit", "wb")
     )
     messages = fitfile.get_messages(
         name=options.name,
         with_definitions=options.with_defs,
+        verbose=options.vverbose,
     )
 
     for n, message in enumerate(messages, 1):

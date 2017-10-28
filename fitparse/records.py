@@ -6,6 +6,12 @@ try:
     int_types = (int, long,)
 except NameError:
     int_types = (int,)
+try:
+    num_types = (int, float, long)
+    str = basestring
+except NameError:
+    num_types = (int, float)
+
 
 try:
     from itertools import zip_longest
@@ -174,6 +180,38 @@ class FieldData(RecordBase):
             # NOTE:Not a property since you may want to override this in a data processor
             self.units = self.field.units
 
+    def _decode_raw_value(self, raw_value):
+        # Apply numeric transformations (scale+offset)
+        if isinstance(raw_value, tuple):
+            # Contains multiple values, apply transformations to all of them
+            return tuple(self._decode_raw_value(x) for x in raw_value)
+        elif isinstance(raw_value, num_types):
+            if self.field.scale:
+                raw_value = float(raw_value) / self.field.scale
+            if self.field.offset:
+                raw_value = raw_value - self.field.offset
+        return raw_value
+
+    def decode_raw_value(self):
+        return self._decode_raw_value(self.raw_value)
+
+    def _compute_raw_value(self, value):
+        # Apply numeric transformations (scale+offset)
+        if isinstance(value, tuple):
+            # Contains multiple values, apply transformations to all of them
+            return tuple(self._compute_raw_value(x) for x in value)
+        elif isinstance(value, num_types):
+            if self.field.scale:
+                value = float(value) * self.field.scale
+            if self.field.offset:
+                value = value + self.field.offset
+        return value
+
+    def set_value(self, val):
+        self.value = val
+        self.raw_value = self._compute_raw_value(val)
+
+
     @property
     def name(self):
         return self.field.name if self.field else 'unknown_%d' % self.def_num
@@ -236,7 +274,7 @@ class FieldData(RecordBase):
 
 
 class BaseType(RecordBase):
-    __slots__ = ('name', 'identifier', 'fmt', 'parse')
+    __slots__ = ('name', 'identifier', 'fmt', 'parse', 'unparse')
     values = None  # In case we're treated as a FieldType
 
     @property
@@ -288,7 +326,6 @@ class Field(FieldAndSubFieldBase):
     __slots__ = ('name', 'type', 'def_num', 'scale', 'offset', 'units', 'components', 'subfields')
     field_type = 'field'
 
-
 class SubField(FieldAndSubFieldBase):
     __slots__ = ('name', 'def_num', 'type', 'scale', 'offset', 'units', 'components', 'ref_fields')
     field_type = 'subfield'
@@ -339,23 +376,30 @@ def parse_string(string):
 
     return string[:end].decode('utf-8', errors='replace') or None
 
+def unparse_string(string):
+    if string is None:
+        return '\x00'
+    else:
+        return string.encode('utf-8') + '\x00'
+
+
 # The default base type
-BASE_TYPE_BYTE = BaseType(name='byte', identifier=0x0D, fmt='B', parse=lambda x: None if all(b == 0xFF for b in x) else x)
+BASE_TYPE_BYTE = BaseType(name='byte', identifier=0x0D, fmt='B', parse=lambda x: None if all(b == 0xFF for b in x) else x, unparse=lambda x: [0xFF] if x is None else x)
 
 BASE_TYPES = {
-    0x00: BaseType(name='enum', identifier=0x00, fmt='B', parse=lambda x: None if x == 0xFF else x),
-    0x01: BaseType(name='sint8', identifier=0x01, fmt='b', parse=lambda x: None if x == 0x7F else x),
-    0x02: BaseType(name='uint8', identifier=0x02, fmt='B', parse=lambda x: None if x == 0xFF else x),
-    0x83: BaseType(name='sint16', identifier=0x83, fmt='h', parse=lambda x: None if x == 0x7FFF else x),
-    0x84: BaseType(name='uint16', identifier=0x84, fmt='H', parse=lambda x: None if x == 0xFFFF else x),
-    0x85: BaseType(name='sint32', identifier=0x85, fmt='i', parse=lambda x: None if x == 0x7FFFFFFF else x),
-    0x86: BaseType(name='uint32', identifier=0x86, fmt='I', parse=lambda x: None if x == 0xFFFFFFFF else x),
-    0x07: BaseType(name='string', identifier=0x07, fmt='s', parse=parse_string),
-    0x88: BaseType(name='float32', identifier=0x88, fmt='f', parse=lambda x: None if math.isnan(x) else x),
-    0x89: BaseType(name='float64', identifier=0x89, fmt='d', parse=lambda x: None if math.isnan(x) else x),
-    0x0A: BaseType(name='uint8z', identifier=0x0A, fmt='B', parse=lambda x: None if x == 0x0 else x),
-    0x8B: BaseType(name='uint16z', identifier=0x8B, fmt='H', parse=lambda x: None if x == 0x0 else x),
-    0x8C: BaseType(name='uint32z', identifier=0x8C, fmt='I', parse=lambda x: None if x == 0x0 else x),
+    0x00: BaseType(name='enum', identifier=0x00, fmt='B', parse=lambda x: None if x == 0xFF else x, unparse=lambda x: 0xFF if x is None else x),
+    0x01: BaseType(name='sint8', identifier=0x01, fmt='b', parse=lambda x: None if x == 0x7F else x, unparse=lambda x: 0x7F if x is None else x),
+    0x02: BaseType(name='uint8', identifier=0x02, fmt='B', parse=lambda x: None if x == 0xFF else x, unparse=lambda x: 0xFF if x is None else x),
+    0x83: BaseType(name='sint16', identifier=0x83, fmt='h', parse=lambda x: None if x == 0x7FFF else x, unparse=lambda x: 0x7FFF if x is None else x),
+    0x84: BaseType(name='uint16', identifier=0x84, fmt='H', parse=lambda x: None if x == 0xFFFF else x, unparse=lambda x: 0xFFFF if x is None else x),
+    0x85: BaseType(name='sint32', identifier=0x85, fmt='i', parse=lambda x: None if x == 0x7FFFFFFF else x, unparse=lambda x: 0x7FFFFFFF if x is None else x),
+    0x86: BaseType(name='uint32', identifier=0x86, fmt='I', parse=lambda x: None if x == 0xFFFFFFFF else x, unparse=lambda x: 0xFFFFFFFF if x is None else x),
+    0x07: BaseType(name='string', identifier=0x07, fmt='s', parse=parse_string, unparse=unparse_string),
+    0x88: BaseType(name='float32', identifier=0x88, fmt='f', parse=lambda x: None if math.isnan(x) else x, unparse=lambda x: float('nan') if x is None else x),
+    0x89: BaseType(name='float64', identifier=0x89, fmt='d', parse=lambda x: None if math.isnan(x) else x, unparse=lambda x: float('nan') if x is None else x),
+    0x0A: BaseType(name='uint8z', identifier=0x0A, fmt='B', parse=lambda x: None if x == 0x0 else x, unparse=lambda x: 0x0 if x is None else x),
+    0x8B: BaseType(name='uint16z', identifier=0x8B, fmt='H', parse=lambda x: None if x == 0x0 else x, unparse=lambda x: 0x0 if x is None else x),
+    0x8C: BaseType(name='uint32z', identifier=0x8C, fmt='I', parse=lambda x: None if x == 0x0 else x, unparse=lambda x: 0x0 if x is None else x),
     0x0D: BASE_TYPE_BYTE,
 }
 
